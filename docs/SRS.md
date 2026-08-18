@@ -2,10 +2,14 @@
 
 ## SoloLevelUp — Gamified Self-Improvement & Habit System
 
-**Document version:** 1.0
+**Document version:** 1.1
 **Status:** Draft for review
 **Author:** Claude (drafted from product reference video + repository context)
 **Target platforms:** Web, Android, Windows (single shared account across all three)
+**Deployment context:** personal/single-user project — no company, no public app-store listing required; this shapes several decisions below (§7.2, §7.6, §8) toward zero ongoing cost rather than multi-tenant scale.
+
+**Changelog**
+- 1.1 — Resolved the technology-stack open question (Flutter + Supabase, §7.2); added a Claude MCP integration module (§5.9, §7.6) so Claude can read progress and author challenges/quests on the user's behalf; replaced the placeholder content-sourcing assumption with a concrete, copyright-safe Daily Learning content pipeline (§5.7.1).
 
 ---
 
@@ -80,6 +84,7 @@ SoloLevelUp is a new, self-contained product: one backend service (auth, data, s
 7. **Daily Learning** — curated book-summary content feed, recommendation logic, category filters, reading progress, "Done" tracking.
 8. **Cross-Platform Sync** — real-time propagation of all state changes across a user's signed-in devices.
 9. **Notifications** — reminders for pending quests, streak-at-risk alerts, achievement unlocks (push on Android/Windows, web push/browser notifications on Web).
+10. **Claude MCP Integration** — an MCP server exposing the user's own progress, streaks, and Rise Rating to Claude as tools, and letting Claude create/adjust quests and generate new challenge weeks on the user's behalf (see §5.9).
 
 ### 2.3 User Classes and Characteristics
 
@@ -107,8 +112,9 @@ SoloLevelUp is a new, self-contained product: one backend service (auth, data, s
 ### 2.6 Assumptions and Dependencies
 
 - Users have a valid email address or an OAuth-capable identity (Google/Apple/Microsoft) for account creation.
-- Book-summary content is either licensed/curated by the product team or authored in-house; this SRS assumes content already exists or is supplied via an admin tool (content sourcing itself is out of scope).
+- Daily Learning content is generated, not licensed — see §5.7.1 for the concrete sourcing/generation pipeline (this replaces the earlier "assume content exists" placeholder).
 - Push notification delivery depends on platform-native services (FCM for Android/Web push, WNS or a cross-platform push provider for Windows).
+- Single-user deployment: the app is built for one account (the owner's). Multi-tenant concerns (per-user billing, admin moderation of other users' content, abuse handling) are out of scope; "admin" and "the user" are the same person, and the "admin API" in FR-6/FR-7 is simply an authenticated endpoint the owner (or Claude, via the MCP server in §5.9) calls directly.
 
 ---
 
@@ -134,10 +140,11 @@ None required beyond standard platform APIs (touch input, notification services)
 
 ### 3.3 Software Interfaces
 
-- **Backend API**: REST or GraphQL (see §7.2 for recommendation) consumed identically by all three clients; versioned (`/v1/...`).
-- **Auth provider**: OAuth 2.0 / OpenID Connect for Google/Apple/Microsoft sign-in, plus first-party email+password.
+- **Backend API**: Supabase's auto-generated REST/RPC layer plus Postgres Realtime (see §7.2), consumed identically by all three Flutter clients.
+- **Auth provider**: Supabase Auth — OAuth 2.0 / OpenID Connect for Google/Apple/Microsoft sign-in, plus first-party email+password.
 - **Push notification services**: FCM (Android, Web Push), and a Windows-compatible channel (WNS via FCM-to-WNS bridge, or a unified provider such as OneSignal/Firebase covering Windows via web-based notifications in the packaged app).
-- **Content/admin API**: internal-only endpoints for publishing Daily Learning items and Achievement definitions.
+- **Content/admin API**: the same Supabase endpoints, called directly by the owner or by Claude via the MCP server (§5.9) for publishing Daily Learning items and Achievement definitions — no separate admin surface for a single-user deployment.
+- **MCP server**: a stdio (local) or remote HTTP/SSE MCP server exposing the tools in §5.9, sitting alongside the three clients as a fourth consumer of the same backend.
 - **Analytics/crash reporting**: a shared analytics SDK/event schema (see §6.6) instrumented identically on all three clients so funnels are comparable.
 
 ### 3.4 Communications Interfaces
@@ -266,6 +273,18 @@ Each Quest is tagged with one primary stat category at creation (default inferre
 - **FR-7.3** Selecting an item shall open a full-screen reader presenting the chaptered `summary_text`, with scroll-based progress tracking persisted to `UserLearningProgress.progress_pct`.
 - **FR-7.4** Reaching the end of a summary shall mark the item `done`, move it out of Recommended and into the Done tab, and (if configured) contribute to the Wisdom stat per §5.5.1.
 - **FR-7.5** Reading progress on a given item shall resume from the last-read position when reopened on any device.
+- **FR-7.6** The system shall never surface the same `LearningItem` twice in the Recommended feed within one full cycle of the catalog (i.e., "unique every day" means *no repeats until every item has been shown*, not that content is regenerated from scratch daily).
+
+#### 5.7.1 Content Sourcing Pipeline (copyright-safe, zero recurring cost)
+
+There is no free, legal API for ready-made commercial book summaries (services like Blinkist license their summaries and don't expose a public API; reproducing their or a publisher's copyrighted condensation verbatim would also infringe copyright even if scraped). The pipeline below avoids both problems by never storing or displaying anyone else's copyrighted summary text — every `summary_text` in the catalog is **original text synthesized specifically for this app**, seeded from free public *metadata* only:
+
+1. **Metadata source (free, no key required for light use):** the [Open Library Books API](https://openlibrary.org/dev/docs/api/books) and/or the [Google Books API](https://developers.google.com/books) supply title, author, publication year, subject/category tags, and a short public-domain-safe blurb for virtually any book — used only to identify *which* book and *what it's broadly about*, never copied into `summary_text`.
+2. **Summary generation:** for each catalog entry, Claude is given the book's title/author/subject metadata and writes an original ~400–600 word insight-card summary in the app's own voice (key ideas, one or two actionable takeaways, tone matching the "Rise" framing) — this is original synthesis from public knowledge of the book's ideas, not a reproduction of the book's or any third party's copyrighted prose, which is the same legal posture as a human writing their own book-report notes.
+3. **Batch pre-generation, not live daily calls:** because this is a personal single-user app, the cheapest and simplest approach is to generate a batch (e.g., 100–365 items) **once**, in an ordinary Claude conversation (using the subscription the user already has — $0 marginal cost, no API billing), and bulk-insert the results into `LearningItem` via the MCP `add_learning_item` tool (§5.9) or a one-off seed script. Refilling the catalog later (another 100 items every few months) is the same zero-cost action.
+4. **Optional live automation:** if the user later wants the catalog to top itself up automatically without a manual chat session, an Edge Function can call the Claude API on a weekly cron to generate a handful of new items — this is the *one* place a small real operating cost can appear (a short summary is a fraction of a cent to a few cents per item on current Claude pricing), and is opt-in, not required for v1.
+5. **Daily selection ("Recommended" ordering):** a deterministic function — `catalog[(challenge_day_number + user_cycle_offset) % catalog_size]`, skipping items already marked `done` — picks the day's featured item, guaranteeing no repeat until a full pass through the catalog, with zero server compute beyond a modulo.
+6. **Attribution, not reproduction:** each item still credits the real book/author for discoverability (title, author, cover art placeholder or a licensed-for-use generic cover), but the summary body itself is the app's own generated content — this is what makes it legally distributable/displayable even though the underlying books are copyrighted.
 
 ### 5.8 Notifications
 
@@ -274,6 +293,17 @@ Each Quest is tagged with one primary stat category at creation (default inferre
 - **FR-8.3** The system shall send an achievement-unlocked notification at the moment of unlock.
 - **FR-8.4** Notification delivery shall target only the user's currently-registered `Device` push tokens for the platform capable of receiving it (Android/Windows native push, Web Push where the browser permission is granted).
 - **FR-8.5** A user shall be able to enable/disable each notification category independently in Settings, and this preference shall apply uniformly regardless of which platform they're currently on.
+
+### 5.9 Claude MCP Integration
+
+An MCP (Model Context Protocol) server exposes the same backend the three clients use, as a set of tools, so Claude (in Claude Desktop, Claude Code, or as a claude.ai custom connector) can act as a coach: reviewing progress and authoring/adjusting the user's quests and challenges directly, instead of the user hand-entering everything in the app.
+
+- **FR-9.1** The MCP server shall expose read tools: `get_today` (current day's quests + statuses), `get_rise_rating` (all three lenses), `get_streaks`, `get_achievements`, `get_metrics_summary` — each returning the same data the clients render, sourced from the same backend (no separate data path, per AR-1).
+- **FR-9.2** The MCP server shall expose write tools: `create_quest`, `update_quest`, `archive_quest`, `complete_quest`, `skip_quest` — subject to the identical server-side validation and stat/streak recomputation as a write from a client app (AR-7); an MCP-originated write is indistinguishable from a client write once persisted, and syncs to all open clients per NFR-1.2.
+- **FR-9.3** The MCP server shall expose a `generate_challenge_week` tool that, given the user's current Rise Rating, recent completion rate, and (optionally) a natural-language goal from the user (e.g., "focus on Strength this week," "I'm traveling, make it lighter"), proposes a set of quests for the coming week; proposed quests shall be staged for the user's confirmation by default (not silently activated), with an explicit `auto_apply` flag the user can enable once they trust the suggestions.
+- **FR-9.4** The MCP server shall expose `add_learning_item` (per §5.7.1) so Claude can top up the Daily Learning catalog directly from a chat session.
+- **FR-9.5** The MCP server shall authenticate as the single app owner using a long-lived personal access token or the backend's service-role credential, scoped only to that one account — no multi-user auth flow is required (per §2.6, single-user deployment).
+- **FR-9.6** The MCP server shall be runnable either locally over stdio (attached to Claude Desktop/Claude Code, zero hosting cost, recommended default for a personal project) or deployed as a small remote HTTP/SSE MCP endpoint (e.g., on a free-tier edge function host) and added as a claude.ai custom connector, for access from a phone or web-based Claude session without a local machine running.
 
 ---
 
@@ -334,13 +364,13 @@ This section exists because "same account, three platforms" is the central techn
 - **AR-1** There shall be exactly one backend service and one database of record. Web, Android, and Windows are clients of that service; none may maintain an independent authoritative copy of user data.
 - **AR-2** Authentication shall be centralized (e.g., a dedicated auth provider or a self-hosted OAuth2/OIDC-compliant service) issuing tokens honored identically by all three clients against the same API.
 
-### 7.2 Recommended Technology Approach
+### 7.2 Technology Stack (decision)
 
-To satisfy "one account, three platforms" with the least drift risk, this SRS recommends (final choice is an engineering decision, not mandated by this document):
+Given a personal, single-user deployment where aesthetic polish and animation quality matter (this is a visually-driven, game-like product) and ongoing cost must stay at $0, the stack is:
 
-- **Backend**: a single REST or GraphQL API (Node.js/NestJS, or equivalent) + PostgreSQL for relational data (User, Challenge, Quest, logs) + a real-time channel (WebSocket, e.g., via Socket.IO, or a managed real-time DB like Firestore/Supabase Realtime) for cross-device sync push.
-- **Clients**: given the requirement is Web + Android + Windows (not iOS/macOS), a single cross-platform UI framework capable of targeting all three from one codebase is strongly preferred to minimize logic drift — **Flutter** (Web, Android, Windows targets from one codebase) or **React**-based stack (React/Next.js for Web, React Native + `react-native-windows` for Android/Windows) are the two leading candidates. A fully-native-per-platform approach (Kotlin/Compose for Android, WinUI3/.NET for Windows, React or similar for Web) is viable but triples UI implementation and review effort and increases the risk that streak/rating logic (already required to be server-computed, AR-1) still drifts in presentation edge cases; it should only be chosen if platform-specific polish outweighs that cost.
-- **Shared client logic**: regardless of UI framework choice, non-UI logic (API client, caching layer, offline write queue, auth token refresh) should live in a shared module/package consumed by all client targets.
+- **Client framework — Flutter.** One Dart codebase compiles to Android (native ARM), Windows (native Win32 desktop), and Web (CanvasKit/WASM), which directly satisfies AR-1's "no platform-specific drift" concern for free, since there is only one UI implementation to begin with. Flutter's own rendering engine (Impeller/Skia) draws every pixel itself rather than delegating to each OS's native widget set, which is what makes it the better choice here over React Native: this app leans heavily on custom, game-like visual language (gradient glows, particle-style "level up" effects, swipeable quest cards with physics, animated stat bars) that needs to look *identical* and feel equally smooth on all three platforms, not merely "close enough" per-platform. `react-native-windows` is also comparatively less mature/maintained than Flutter's Windows target. State management: **Riverpod**. Rich animation: Flutter's own animation APIs for most UI, **Rive** for the achievement-unlock/level-up set-pieces (free tier is enough for personal use). Local cache/offline queue: **Drift** (SQLite) implementing the write-queue behavior in NFR-2.1/AR-4.
+- **Backend — Supabase.** Managed Postgres (maps directly onto §4's relational data model), built-in Auth (email+password and Google/Apple/Microsoft OAuth, satisfying FR-1.1–FR-1.2 out of the box with one SDK call per client), Realtime (Postgres change-data-capture over WebSocket, satisfying AR-3's cross-device push without hand-rolling a socket server), Storage (achievement art, book covers), and Edge Functions (Deno/TS) for the server-side-only logic AR-1/NFR-5.1/AR-7 require: streak computation, Rise Rating computation, achievement unlock evaluation, and the daily-learning selection function in §5.7.1. This replaces a hand-built Node/NestJS API with a managed equivalent that has a free tier generous enough for one user indefinitely (see the cost note in §7.7).
+- **Shared client logic**: API client, cache layer, offline write queue, and auth/session handling live in one Dart package shared by all three Flutter targets — there is no second implementation to keep in sync.
 
 ### 7.3 Real-Time Sync
 
@@ -357,6 +387,19 @@ To satisfy "one account, three platforms" with the least drift risk, this SRS re
 
 - **AR-8** The system shall track a `Device` record per signed-in client install (per §4.1) to support targeted push notifications and the session list in FR-1.5.
 
+### 7.6 MCP Server Architecture
+
+- **AR-9** The MCP server (§5.9) shall be a thin wrapper over the same Supabase backend the clients use — it calls the same tables/RPCs/Edge Functions, never a parallel data path — so a quest Claude creates behaves identically to one created in the app (AR-1, AR-7).
+- **AR-10** For a single-user deployment, the recommended default is a **local MCP server run over stdio** (Python `FastMCP` or the Node MCP SDK), holding the Supabase service-role key in a local `.env` file, launched by Claude Desktop/Claude Code's MCP config — this requires no hosting, no public endpoint, and no additional cost or attack surface beyond the user's own machine.
+- **AR-11** If remote access (e.g., from claude.ai on a phone) is desired, the same server logic shall be deployable as a small remote MCP endpoint on a free-tier edge platform (e.g., Cloudflare Workers, which has first-class MCP hosting support) and registered as a claude.ai custom connector; this is additive, not a replacement for AR-10.
+
+### 7.7 Cost Note (personal deployment)
+
+- Supabase free tier (500MB DB, 50k MAU, 1GB storage, 5GB egress/mo) comfortably covers a single-user account indefinitely.
+- Flutter builds for Android/Windows are sideloaded directly (no Google Play $25 fee or Microsoft Store account needed for personal use); Web build deploys free to Cloudflare Pages/Vercel.
+- The MCP server run locally (AR-10) has zero hosting cost; the optional remote variant (AR-11) fits Cloudflare Workers' free tier.
+- The only place a non-zero recurring cost can appear is the *optional* live Daily Learning automation in §5.7.1 step 4 (Claude API calls on a cron) — skip it and use the manual batch-generation approach (step 3) to stay at exactly $0.
+
 ---
 
 ## 8. Out of Scope / Deferred (v1)
@@ -371,11 +414,12 @@ To satisfy "one account, three platforms" with the least drift risk, this SRS re
 
 ## 9. Open Questions
 
-1. Final client technology stack (Flutter vs. React/React Native vs. fully native) — pending an engineering spike per §7.2.
-2. Exact quest-category → stat weighting formula (§5.5.1) — needs product/design sign-off on initial values and tuning process.
-3. Push provider for Windows (native WNS vs. unified provider) — depends on the Windows packaging decision (MSIX/Store vs. unpackaged).
-4. Data retention window after account deletion (FR-1.6 proposes 30 days) — needs legal/compliance confirmation.
-5. Monetization boundary between free and premium tiers — not specified in this SRS, needed before pricing/paywall implementation.
+1. ~~Final client technology stack~~ — **resolved**: Flutter + Supabase (§7.2).
+2. ~~Daily Learning content source~~ — **resolved**: Claude-generated original summaries seeded from free book metadata, batch-generated at $0 marginal cost (§5.7.1).
+3. Exact quest-category → stat weighting formula (§5.5.1) — needs the user's own sign-off on initial values and tuning process (no separate "product team" in a personal deployment — this is just a taste call).
+4. Push provider for Windows (native WNS vs. unified provider) — depends on the Windows packaging decision (MSIX vs. unpackaged .exe); low priority for a single-user app since in-app "streak at risk" state is also visible on open.
+5. Data retention window after account deletion (FR-1.6 proposes 30 days) — low-priority for single-user deployment (no compliance obligation to a third party), but a sane default to keep for hygiene.
+6. Whether to enable the optional live Daily Learning automation (§5.7.1 step 4, the only component with a non-zero recurring cost) — default is **off** (manual batch generation) unless the user wants full hands-off automation.
 
 ## 10. Acceptance Criteria (Definition of Done for this SRS's implementation)
 
